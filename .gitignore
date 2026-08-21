@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Personal research profile — commit the example, not the real one
+config/research_profile.md
+
+# State / generated
+data/
+
+# Build artifacts
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# macOS
+.DS_Store

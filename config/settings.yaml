@@ -1,0 +1,37 @@
+obsidian:
+  vault_path: "~/Documents/FreshLit"  # overridden by FRESHLIT_VAULT_PATH in .env
+  digest_folder: ""          # relative to vault_path ("" = root of that folder)
+
+ingestion:
+  lookback_days: 7
+  timezone: "UTC"
+  max_results_per_query: 200  # per OpenAlex/EPMC query (search results are relevance-sorted)
+  openalex_topics:
+    - "T11764"   # Evolution and Genetic Dynamics
+    - "T11287"   # Cancer Genomics and Diagnostics
+    - "T10012"   # Genetic Diversity and Population Structure
+  keywords: []               # populated from config/research_profile.md at runtime
+  europe_pmc:
+    enabled: true
+    sources: ["PPR"]         # preprints (bioRxiv/medRxiv)
+
+api:
+  request_timeout_seconds: 30
+  max_pages: 50
+  retry_backoff_seconds: 2
+
+filtering:
+  dedup_title_similarity: 0.92
+  vector_threshold: 0.65     # floor for obvious junk; ranking does the real work
+  max_llm_candidates: 40     # LLM-score only the top-N vector-ranked survivors
+  llm_batch_size: 15         # papers scored per single LLM request
+  score_cutoff: 7.0
+  default_journal_weight: 1.0
+  embedding_model: "allenai/specter2_base"
+  embedding_device: "cpu"
+
+llm:
+  base_url: "https://opencode.ai/zen/go/v1"
+  model: "qwen3.5-plus"
+  timeout_seconds: 120       # thinking-mode responses can exceed 30s
+  workers: 3                 # parallel requests; keep low to avoid gateway throttling
