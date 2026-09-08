@@ -53,7 +53,7 @@ def _cmd_run(args) -> None:
     from .nodes import delivery, filtering, ingestion, synthesis
     from .utils.llm import build_client
 
-    settings = load_settings()
+    settings = load_settings(provider_override=getattr(args, "provider", None))
     if args.lookback is not None:
         settings.ingestion.lookback_days = args.lookback
     if args.max_candidates is not None:
@@ -65,8 +65,6 @@ def _cmd_run(args) -> None:
     if not settings.profile_vector_path.exists():
         log.info("No profile vector found; building it now...")
         _cmd_build_profile(settings)
-
-    client = build_client(settings)
 
     cache_path = settings.project_root / "data" / "last_ingest.json"
     if args.from_cache and cache_path.exists():
@@ -92,14 +90,15 @@ def _cmd_run(args) -> None:
             log.info("  %2d. %.3f  [%s] %s", i, sim, p.source_type, p.title[:90])
         return
 
-    qualified = filtering.filter_and_score(
-        papers, settings, client, dry_run=args.dry_run
-    )
-    if not qualified:
-        log.info("No papers passed all filters; nothing to deliver.")
-        return
+    with build_client(settings) as client:
+        qualified = filtering.filter_and_score(
+            papers, settings, client, dry_run=args.dry_run
+        )
+        if not qualified:
+            log.info("No papers passed all filters; nothing to deliver.")
+            return
 
-    summaries, pulse = synthesis.synthesize(client, settings, qualified)
+        summaries, pulse = synthesis.synthesize(client, settings, qualified)
     path = delivery.deliver(
         settings,
         summaries,
@@ -134,7 +133,9 @@ def main() -> None:
     run.add_argument("--max-candidates", type=int, default=None,
                      help="Override filtering.max_llm_candidates")
     run.add_argument("--model", default=None,
-                     help="Override llm.model (e.g. qwen3.5-plus)")
+                      help="Override llm.model (e.g. gpt-5.6-luna)")
+    run.add_argument("--provider", choices=("codex", "gateway"), default=None,
+                     help="Override llm.provider")
     run.add_argument("--output-name", default=None,
                      help="Override digest filename (for A/B comparison)")
     run.add_argument("--skip-llm", action="store_true",
@@ -142,7 +143,8 @@ def main() -> None:
     run.add_argument("--from-cache", action="store_true",
                      help="Reuse data/last_ingest.json instead of refetching")
     run.add_argument("--dry-run", action="store_true",
-                     help="Do not write to the DB or the vault")
+                     help="Skip paper-disposition updates and digest delivery; "
+                          "setup/cache writes and LLM requests still occur")
     run.add_argument("--force", action="store_true",
                      help="Overwrite an existing weekly digest")
     run.add_argument("-v", "--verbose", action="store_true")

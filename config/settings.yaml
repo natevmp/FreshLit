@@ -31,7 +31,11 @@ filtering:
   embedding_device: "cpu"
 
 llm:
+  provider: "codex"
+  model: "gpt-5.6-luna"
+  timeout_seconds: 120
+  workers: 3
+  max_retries: 2
+  codex_home: "~/Library/Application Support/FreshLit/codex-home" # FRESHLIT_CODEX_HOME overrides this
+  # Rollback-only gateway setting; used only when provider is "gateway".
   base_url: "https://opencode.ai/zen/go/v1"
-  model: "qwen3.5-plus"
-  timeout_seconds: 120       # thinking-mode responses can exceed 30s
-  workers: 3                 # parallel requests; keep low to avoid gateway throttling

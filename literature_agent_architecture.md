@@ -1,6 +1,6 @@
 # Architecture Specification: FreshLit — Automated Literature Monitoring Agent
 
-> **Revision note.** This is an adapted version of the original spec, incorporating: (1) project rename to **FreshLit** (package `freshlit`), (2) LLM provider switched to the **opencode-go** OpenAI-compatible gateway, (3) local **SPECTER2** embeddings (the gateway is chat-only), (4) an editable **research profile** Markdown file driving topics/keywords/vector filtering, (5) a central **configuration loader** (the original spec defined config file contents but no loading mechanism), and (6) robustness/security hardening surfaced by design review (request timeouts + pagination + retries, NULL-safe/DOI-normalized dedup, path-containment + atomic vault writes, secret hygiene).
+> **Revision note.** This is an adapted version of the original spec, incorporating: (1) project rename to **FreshLit** (package `freshlit`), (2) migration of the primary LLM provider to the official **openai-codex SDK** with ChatGPT OAuth (the former opencode-go integration is retained only for explicit rollback), (3) local **SPECTER2** embeddings, (4) an editable **research profile** Markdown file driving topics/keywords/vector filtering, (5) a central **configuration loader** (the original spec defined config file contents but no loading mechanism), and (6) robustness/security hardening surfaced by design review (request timeouts + pagination + retries, strict structured-output validation, isolated/disabled Codex capabilities, NULL-safe/DOI-normalized dedup, path-containment + atomic vault writes, secret hygiene).
 
 This document defines the system architecture, node interfaces, schemas, database tables, and execution flow for an automated literature monitoring agent named **FreshLit**. An executing code agent can read this specification directly to construct and run the system on the local filesystem.
 
@@ -20,10 +20,22 @@ FreshLit is a modular, four-stage ETL pipeline executed on a scheduled basis (we
 
 **Runtime stack**
 
-- **LLM scoring & synthesis:** the [opencode-go](https://opencode.ai/zen/go/v1) OpenAI-compatible gateway (default model `qwen3.5-plus`), driven through `instructor` for schema-enforced JSON output. Model and base URL are configurable in `config/settings.yaml`.
-- **LLM structured-output negotiation:** `freshlit/utils/llm.py` auto-negotiates the instructor mode (TOOLS → JSON → MD_JSON) since gateway structured-output support varies by model, then locks the working mode for the rest of the run.
-- **Embeddings:** local `allenai/specter2_base` via `sentence-transformers` (opencode-go is chat-only; SPECTER2 is a scientific-text domain model). Configurable device (`cpu`/`cuda`).
+- **LLM scoring & synthesis (primary):** the official `openai-codex==0.147.0` SDK using an existing ChatGPT OAuth profile. The default provider is `codex` and the default model is `gpt-5.6-luna`.
+- **LLM provider boundary:** `freshlit/utils/llm.py` exposes one provider-neutral structured client. It constructs only the explicitly selected provider and never falls back. The opencode-go OpenAI-compatible client and `instructor` mode negotiation remain available only when `gateway` is explicitly selected for rollback.
+- **Structured output:** Pydantic response schemas are copied and recursively normalized to OpenAI strict JSON Schema (all object properties required, defaults removed, extra properties forbidden, and unsupported map-like schemas rejected). The returned JSON then undergoes strict Pydantic validation before use.
+- **Embeddings:** local `allenai/specter2_base` via `sentence-transformers` (SPECTER2 is a scientific-text domain model). Configurable device (`cpu`/`cuda`).
 - **Configuration:** a central loader (`freshlit/utils/config.py`) validates and exposes all tunables at startup. See Section 5.
+
+**Codex runtime isolation and lifecycle**
+
+- Production startup requires an existing, current-user-owned, dedicated `FRESHLIT_CODEX_HOME` disjoint from the repository with exact mode `0700` permissions and forces both the ChatGPT login method and built-in OpenAI provider. FreshLit neither initiates login nor opens/parses auth files. It starts the app-server through `/usr/bin/env -i` with only explicit profile, temporary-directory, locale, and bundled-runtime path values, then verifies the effective safety configuration, absence of custom providers/endpoint redirects, account type, and requested model. This hardened launch currently requires a POSIX system with `/usr/bin/env` and has no inherited API-key/billed OpenAI API path.
+- A pipeline run creates one shared Codex runtime. Every structured request (and every retry) starts a fresh ephemeral thread in a fresh temporary working directory outside the project. Request directories are deleted after use.
+- Every thread uses deny-all approval and a read-only sandbox. Shell/exec tools, network/web search, MCP, agents, skills, hooks, apps, memory, history persistence, telemetry, feedback, update checks, and inherited shell environment are explicitly disabled. The client also rejects completed turns that report tool-like activity.
+- The low-level approval callback explicitly declines server requests. A local override of the pinned SDK's private message router retains early `turn/completed` notifications and atomically replays buffered events before publishing the live queue. SDK upgrades require re-review and regression testing of this compatibility override.
+- Batch workers may issue requests concurrently through the shared runtime, bounded by `llm.workers`. The orchestrator owns the runtime with a context manager and closes it cleanly and idempotently after filtering and synthesis, including exceptional exits.
+- `llm.timeout_seconds` is one total deadline across thread startup, turns, and retries for a structured request. An over-deadline turn is interrupted; failed bounded cancellation poisons and terminates the shared runtime before the request fails after a short grace. Successful cancellation fails only that request and leaves the runtime available. `llm.max_retries` applies only to schema/Pydantic-invalid output and SDK-classified retryable failures. Other failures stop that request; none trigger per-paper replay, a provider change, or an API-key fallback.
+- Explicit gateway rollback uses a parse-only Tenacity retry policy. Response-mode negotiation is limited to Pydantic validation or HTTP 400/404/422 errors with explicit mode-specific error metadata; generic request, model, endpoint, authentication, rate-limit, and transport failures are terminal after one HTTP attempt.
+- Delivery trusts the existing configured vault root, then opens/creates nested digest directories using nofollow directory-relative operations. It holds in-process and advisory locks across the complete merge and atomic replacement, retaining a content-free `.freshlit-delivery.lock` entry. Unsupported platforms fail closed. Uncooperative external editors are outside the advisory-lock guarantee.
 
 ---
 
@@ -53,10 +65,10 @@ freshlit/                        # project root
 │   └── utils/
 │       ├── config.py            # Central configuration loader (Pydantic-validated)
 │       ├── db.py                # SQLite wrapper functions
-│       ├── llm.py               # opencode-go (OpenAI-compatible) / Instructor client setup
+│       ├── llm.py               # Codex structured client + explicit gateway rollback client
 │       └── embeddings.py        # SPECTER2 embedding model loader (lazy singleton)
 ├── .env                         # Secrets (gitignored)
-├── .env.example                 # Documented template for required secrets
+├── .env.example                 # Documented environment template (no credentials)
 ├── .gitignore
 ├── pyproject.toml               # Package metadata + `freshlit` console-script entry point
 ├── requirements.txt
@@ -117,7 +129,7 @@ This node operates as a 4-step reduction funnel:
    * Drop records with missing/short abstracts (< 50 chars) and those below `filtering.vector_threshold` (default `0.65`).
    * Rank survivors by similarity and keep only the top `filtering.max_llm_candidates` (default `40`) — SPECTER2 similarities cluster in a narrow band, so ranking + a candidate budget is the effective filter; the threshold is only a floor.
 4. **LLM Reasoning & Weighted Scoring:**
-   Pass surviving items to the LLM (via `instructor`) against a rubric grounded in the research profile text. Scoring is **batched**: up to `filtering.llm_batch_size` papers per structured request (via the `LLMEvaluationBatch` wrapper model), run concurrently at `llm.workers`, with per-paper fallback if a batch request fails.
+   Pass surviving items through the selected structured client against a rubric grounded in the research profile text. Scoring is **batched**: up to `filtering.llm_batch_size` papers per structured request (via the `LLMEvaluationBatch` wrapper model), run concurrently at `llm.workers`, with per-paper fallback if a batch request fails. Request-local opaque IDs (`P0001`, etc.) avoid exposing source IDs as control identifiers. The response must have exactly one item per requested ID; cardinality, unknown IDs, duplicates, and missing IDs are validated before results are restored to request order. Contract failures trigger only per-paper retry, never a provider change.
 
 ```python
 from pydantic import BaseModel, Field
@@ -173,7 +185,7 @@ class ProcessedPaperSummary(BaseModel):
 2. **Field Pulse Generation:**
    Pass all extracted summaries in a single context window to generate 3 bullet points characterizing macro trends or overlapping methodologies in the current batch.
 
-Extraction is **batched** the same way as scoring: up to `filtering.llm_batch_size` papers per structured request (via the `PaperExtractionBatch` wrapper model), run concurrently at `llm.workers`, with per-paper fallback.
+Extraction is **batched** the same way as scoring: up to `filtering.llm_batch_size` papers per structured request (via the `PaperExtractionBatch` wrapper model), run concurrently at `llm.workers`, with per-paper fallback. It uses the same opaque request-local IDs and validates exact cardinality, membership, uniqueness, and completeness before mapping results back to input order. Evaluation, extraction, batch-wrapper, and field-pulse models use strict Pydantic validation and reject extra fields.
 
 ---
 
@@ -199,7 +211,8 @@ tags:
 papers_analyzed: 14
 papers_selected: 4
 top_score: 9.2
-llm_model: qwen3.5-plus
+llm_model: gpt-5.6-luna
+llm_provider: codex
 ---
 
 # 🔬 Literature Digest: Week WW, YYYY
@@ -263,7 +276,7 @@ CREATE INDEX IF NOT EXISTS idx_norm_title ON processed_papers(normalized_title);
 
 All configuration is loaded once at startup by `freshlit/utils/config.py`, which:
 
-1. Loads `.env` via `python-dotenv`.
+1. Parses `.env` via `python-dotenv` without mutating the process environment.
 2. Parses `config/settings.yaml` into a Pydantic model with **fail-fast validation** (missing/blank required values raise a clear error before the pipeline runs).
 3. Loads `config/journal_tiers.json` (default `{}` if absent).
 4. Exposes a single `Settings` object consumed by every node; no node reads config files directly.
@@ -305,10 +318,13 @@ filtering:
   embedding_device: "cpu"
 
 llm:
-  base_url: "https://opencode.ai/zen/go/v1"
-  model: "qwen3.5-plus"
-  timeout_seconds: 120       # thinking-mode responses can exceed 30s
-  workers: 3                 # parallel LLM requests; keep low to avoid throttling
+  provider: "codex"          # "gateway" is explicit rollback only
+  model: "gpt-5.6-luna"
+  timeout_seconds: 120       # total deadline per structured request, across retries
+  workers: 3                 # concurrent batches through the shared runtime
+  max_retries: 2             # invalid output / SDK-classified transient failures
+  codex_home: null           # set with FRESHLIT_CODEX_HOME for LLM runs
+  base_url: "https://opencode.ai/zen/go/v1"  # rollback gateway only
 ```
 
 ### `config/journal_tiers.json`
@@ -328,11 +344,15 @@ An editable Markdown file with two sections that drive the whole pipeline: a `##
 ### `.env` File
 
 ```env
-OPENCODE_GO_API_KEY="your-opencode-go-key"
+FRESHLIT_CODEX_HOME="/absolute/path/to/freshlit-codex-home"
+FRESHLIT_LLM_PROVIDER="codex"
 OPENALEX_API_KEY=""
+# OPENCODE_GO_API_KEY=""
 ```
 
-`OPENCODE_GO_API_KEY` is **required** (the loader fails fast if missing/blank); `OPENALEX_API_KEY` is **optional but recommended** (anonymous OpenAlex requests have a small daily budget that resets midnight UTC). `.env` is gitignored; `.env.example` documents the keys without values.
+`FRESHLIT_CODEX_HOME` is the primary required LLM setting. It must resolve to an existing, user-owned dedicated Codex profile directory outside the repository with no group/other permissions. Create it without `sudo` (for example, `mkdir -p "$HOME/.freshlit-codex" && chmod 700 "$HOME/.freshlit-codex"`), then perform a one-time ChatGPT OAuth login using the [official Codex tooling and documentation](https://developers.openai.com/codex/auth/) with `CODEX_HOME` directed to that directory. FreshLit does not initiate login and does not inspect auth-file contents.
+
+`FRESHLIT_LLM_PROVIDER` is optional and defaults to `codex`. `OPENCODE_GO_API_KEY` is neither read nor required in Codex mode; it is required only after the legacy `gateway` provider is explicitly selected by configuration or `--provider gateway`. Rotate any key that was previously exposed before rollback use. There is no automatic provider fallback. `OPENALEX_API_KEY` is **optional but recommended** (anonymous OpenAlex requests have a small daily budget that resets midnight UTC). `.env` is gitignored; `.env.example` documents settings without credentials.
 
 ---
 
@@ -340,17 +360,17 @@ OPENALEX_API_KEY=""
 
 An executing code agent must implement components in this exact sequence:
 
-1. Create directory structure and set up a standard Python virtual environment with dependencies (`pydantic`, `instructor`, `openai`, `pyyaml`, `requests`, `numpy`, `scikit-learn`, `sentence-transformers`, `jellyfish`, `python-dotenv`, `peft`). Add `.gitignore` (excluding `.env`, `data/cache.db`, `data/profile_exemplars.json`, `data/last_ingest.json`, `__pycache__/`, `.venv/`) and `.env.example`. Declare the package and the `freshlit = "freshlit.main:main"` console-script entry point in `pyproject.toml`, and `pip install -e .` so a global `freshlit` command runs the current source.
+1. Create directory structure and set up a standard Python virtual environment with dependencies (`openai-codex==0.147.0`, `pydantic`, `pyyaml`, `requests`, `numpy`, `scikit-learn`, `sentence-transformers`, `jellyfish`, `python-dotenv`, `peft`; `instructor` and `openai` are retained for gateway rollback only). Add `.gitignore` (excluding `.env`, `data/cache.db`, `data/profile_exemplars.json`, `data/last_ingest.json`, `__pycache__/`, `.venv/`) and `.env.example`. Declare the package and the `freshlit = "freshlit.main:main"` console-script entry point in `pyproject.toml`, and `pip install -e .` so a global `freshlit` command runs the current source.
 2. Implement `freshlit/utils/config.py` (central loader) and `freshlit/utils/db.py` (including the first-author surname extractor handling `Last Initial(s)`); run the migration script to build `data/cache.db`.
-3. Implement `freshlit/utils/llm.py` (opencode-go OpenAI-compatible client + `instructor` wrapper with TOOLS→JSON→MD_JSON mode negotiation) and `freshlit/utils/embeddings.py` (lazy SPECTER2 loader).
+3. Implement `freshlit/utils/llm.py` with a provider-neutral protocol, the official Codex client (dedicated ChatGPT profile preflight, shared runtime, ephemeral request threads/temp directories, strict schema normalization and Pydantic validation, deadlines/retries, deny-all/read-only/disabled capabilities, context-managed shutdown), and the explicit opencode-go/Instructor rollback client; implement `freshlit/utils/embeddings.py` (lazy SPECTER2 loader).
 4. Implement `freshlit/nodes/ingestion.py` to fetch and normalize JSON from OpenAlex (API key, timeouts, pagination, retries, OR-combined keyword search, ingest-cache save/load) and Europe PMC.
-5. Implement `freshlit/nodes/filtering.py` including NULL-safe/DOI-normalized SQLite dedup, Jaro-Winkler title dedup with surname matching, vector ranking with candidate budget, and batched LLM rating via `instructor`.
+5. Implement `freshlit/nodes/filtering.py` including NULL-safe/DOI-normalized SQLite dedup, Jaro-Winkler title dedup with surname matching, vector ranking with candidate budget, and batched structured LLM rating with opaque-ID/cardinality validation.
 6. Implement `freshlit/nodes/synthesis.py` to extract structured JSON summaries (batched) and build the executive pulse.
 7. Implement `freshlit/nodes/delivery.py` to compile Markdown payloads and save to the Obsidian vault path with path containment, atomic writes, overwrite handling, and an optional `--output-name` override.
-8. Implement `freshlit/main.py` as a CLI runner (`run`, `build-profile`, `init-db`) that connects Nodes 1–4 sequentially, validates the vault path at startup, and emits operational logs with secret redaction. `run` supports `--lookback`, `--limit`, `--max-candidates`, `--model`, `--output-name`, `--skip-llm` (stop after vector ranking), `--from-cache` (reuse `data/last_ingest.json`), `--dry-run`, and `--force`.
+8. Implement `freshlit/main.py` as a CLI runner (`run`, `build-profile`, `init-db`) that connects Nodes 1–4 sequentially, validates the vault path at startup, and emits operational logs with secret redaction. `run` supports `--lookback`, `--limit`, `--max-candidates`, `--provider codex|gateway`, `--model`, `--output-name`, `--skip-llm` (stop after vector ranking), `--from-cache` (reuse `data/last_ingest.json`), `--dry-run`, and `--force`. It owns the selected structured client in a context manager so the shared runtime is always closed, and passes provider/model provenance to delivery.
 
 ### Performance notes
 
 * **Keyword ingestion** OR-combines the profile keywords into chunked OpenAlex `search=` queries (under the ~4 KB URL limit) instead of one request per keyword.
-* **LLM scoring and synthesis are batched**: up to `filtering.llm_batch_size` papers are evaluated in a single structured request, run concurrently at `llm.workers`. This reduces the gateway round-trips (the dominant cost) by an order of magnitude; each chunk falls back to per-paper calls if the batch request fails.
+* **LLM scoring and synthesis are batched**: up to `filtering.llm_batch_size` papers are evaluated in a single structured request, run concurrently at `llm.workers` through one runtime. This reduces structured-request round trips by an order of magnitude; each chunk falls back to per-paper calls if the batch request or opaque-ID contract fails.
 * **Ingestion is cached** to `data/last_ingest.json` after every run; `--from-cache` and `--skip-llm` provide a fast (~1–2 min) troubleshooting loop that skips API fetching and LLM calls respectively.

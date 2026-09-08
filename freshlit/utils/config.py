@@ -9,10 +9,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from dotenv import dotenv_values
+from pydantic import BaseModel, Field, PositiveInt
 
 
 class ObsidianConfig(BaseModel):
@@ -44,7 +45,7 @@ class FilteringConfig(BaseModel):
     dedup_title_similarity: float = 0.92
     vector_threshold: float = 0.65
     max_llm_candidates: int = 40
-    llm_batch_size: int = 15  # papers scored per single LLM request
+    llm_batch_size: int = Field(default=15, ge=1, le=100)
     score_cutoff: float = 7.0
     default_journal_weight: float = 1.0
     embedding_model: str = "allenai/specter2"
@@ -52,10 +53,13 @@ class FilteringConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
+    provider: Literal["codex", "gateway"] = "codex"
     base_url: str = "https://opencode.ai/zen/go/v1"
-    model: str = "qwen3.5-plus"
-    timeout_seconds: int = 120  # thinking-mode responses can exceed 30s
-    workers: int = 3  # parallel requests; keep low to avoid gateway throttling
+    model: str = "gpt-5.6-luna"
+    timeout_seconds: PositiveInt = 120
+    workers: PositiveInt = 3
+    max_retries: int = Field(default=2, ge=0, le=5)
+    codex_home: Path | None = None
 
 
 class Settings(BaseModel):
@@ -69,7 +73,7 @@ class Settings(BaseModel):
     api: APIConfig
     filtering: FilteringConfig
     llm: LLMConfig
-    opencode_go_api_key: str
+    opencode_go_api_key: str | None = None
     openalex_api_key: str | None
     journal_tiers: dict[str, float]
     research_profile_text: str
@@ -104,10 +108,20 @@ def _extract_keywords(profile_md: str) -> list[str]:
     return keywords
 
 
-def load_settings(project_root: Path | None = None) -> Settings:
+def load_settings(
+    project_root: Path | None = None,
+    provider_override: Literal["codex", "gateway"] | None = None,
+) -> Settings:
     root = Path(project_root) if project_root else _project_root()
 
-    load_dotenv(root / ".env")
+    # Read dotenv values without leaking project configuration into the process.
+    dotenv = dotenv_values(root / ".env")
+
+    def env_value(name: str) -> str:
+        value = os.environ.get(name)
+        if value is None:
+            value = dotenv.get(name)
+        return value.strip() if isinstance(value, str) else ""
 
     settings_file = root / "config" / "settings.yaml"
     if not settings_file.exists():
@@ -140,16 +154,29 @@ def load_settings(project_root: Path | None = None) -> Settings:
     if not ingestion.keywords:
         ingestion.keywords = _extract_keywords(profile_text)
 
-    opencode_key = os.environ.get("OPENCODE_GO_API_KEY", "").strip()
-    if not opencode_key:
-        raise RuntimeError(
-            "OPENCODE_GO_API_KEY is missing or blank. Add it to .env "
-            "(see .env.example)."
-        )
-    openalex_key = os.environ.get("OPENALEX_API_KEY", "").strip() or None
+    llm_raw = dict(raw.get("llm") or {})
+    env_provider = env_value("FRESHLIT_LLM_PROVIDER")
+    if env_provider:
+        llm_raw["provider"] = env_provider
+    if provider_override is not None:
+        llm_raw["provider"] = provider_override
+    codex_home = env_value("FRESHLIT_CODEX_HOME")
+    if codex_home:
+        llm_raw["codex_home"] = codex_home
+    llm = LLMConfig(**llm_raw)
+
+    opencode_key: str | None = None
+    if llm.provider == "gateway":
+        opencode_key = env_value("OPENCODE_GO_API_KEY") or None
+        if not opencode_key:
+            raise RuntimeError(
+                "OPENCODE_GO_API_KEY is missing or blank. Add it to .env "
+                "(see .env.example)."
+            )
+    openalex_key = env_value("OPENALEX_API_KEY") or None
 
     obsidian_raw = raw.get("obsidian") or {}
-    vault_path = os.environ.get("FRESHLIT_VAULT_PATH", "").strip()
+    vault_path = env_value("FRESHLIT_VAULT_PATH")
     if not vault_path:
         vault_path = obsidian_raw.get("vault_path")
     obsidian = ObsidianConfig(
@@ -162,7 +189,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         ingestion=ingestion,
         api=APIConfig(**(raw.get("api") or {})),
         filtering=FilteringConfig(**(raw.get("filtering") or {})),
-        llm=LLMConfig(**(raw.get("llm") or {})),
+        llm=llm,
         opencode_go_api_key=opencode_key,
         openalex_api_key=openalex_key,
         journal_tiers=journal_tiers,
