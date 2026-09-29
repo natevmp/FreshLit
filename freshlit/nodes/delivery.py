@@ -244,6 +244,104 @@ def _validate_filename(filename: str) -> None:
         raise ValueError("filename must be a single safe basename")
 
 
+def validate_destination(settings: Settings, filename: str | None = None) -> Path:
+    """Read-only preflight for the configured digest destination.
+
+    This provides useful failures before expensive pipeline work, but is not a
+    TOCTOU-safe authorization to write. :func:`deliver` remains the final
+    authority and repeats its descriptor-anchored checks while writing.
+    """
+
+    _require_secure_primitives()
+    if filename is not None:
+        _validate_filename(filename)
+    configuredVault = settings.obsidian.vault_path.expanduser()
+    try:
+        configuredStat = os.lstat(configuredVault)
+    except OSError as error:
+        raise ValueError("vault path must be an existing real directory") from error
+    if not stat.S_ISDIR(configuredStat.st_mode):
+        raise ValueError("vault path must be an existing real directory")
+
+    try:
+        vaultPath = configuredVault.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("vault path must be an existing real directory") from error
+
+    path = _target_path(settings, datetime.now(timezone.utc).date())
+    if filename is not None:
+        path = path.with_name(filename)
+    _validate_filename(path.name)
+
+    # Inspect the configured route without following any digest-folder symlink.
+    # abspath normalizes ``.`` and ``..`` but deliberately does not resolve links.
+    configuredDirectory = Path(
+        os.path.abspath(vaultPath / settings.obsidian.digest_folder)
+    )
+    try:
+        directoryParts = configuredDirectory.relative_to(vaultPath).parts
+        path.relative_to(vaultPath)
+    except ValueError as error:
+        raise ValueError("digest destination escapes the configured vault") from error
+
+    nearestExistingParent = vaultPath
+    current = vaultPath
+    missingComponent = False
+    for component in directoryParts:
+        current = current / component
+        if missingComponent:
+            continue
+        try:
+            currentStat = os.lstat(current)
+        except FileNotFoundError:
+            missingComponent = True
+            continue
+        except OSError as error:
+            raise ValueError(
+                "digest directory ancestor cannot be inspected"
+            ) from error
+        if not stat.S_ISDIR(currentStat.st_mode):
+            raise ValueError(
+                "digest directory ancestor is not a real directory"
+            )
+        nearestExistingParent = current
+
+    if not os.access(nearestExistingParent, os.W_OK | os.X_OK):
+        raise PermissionError(
+            "nearest existing digest parent must be writable and traversable"
+        )
+
+    if not missingComponent:
+        for entry, message, accessMode, accessMessage in (
+            (
+                configuredDirectory / path.name,
+                "digest path is not a regular file",
+                os.R_OK,
+                "existing digest must be readable for safe rerun delivery",
+            ),
+            (
+                configuredDirectory / _LOCK_FILENAME,
+                "delivery lock is not a regular file",
+                os.R_OK | os.W_OK,
+                "existing delivery lock must be readable and writable",
+            ),
+        ):
+            try:
+                entryStat = os.lstat(entry)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise ValueError(
+                    f"delivery entry cannot be inspected: {entry.name}"
+                ) from error
+            if not stat.S_ISREG(entryStat.st_mode):
+                raise ValueError(message)
+            if not os.access(entry, accessMode):
+                raise PermissionError(accessMessage)
+
+    return path
+
+
 def _directory_changed_error() -> RuntimeError:
     return RuntimeError("digest directory changed during delivery")
 

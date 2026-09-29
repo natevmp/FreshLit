@@ -3,7 +3,7 @@
 An automated literature-monitoring agent: a four-stage ETL pipeline that ingests
 newly published papers and preprints, filters out duplicates and off-topic items,
 performs LLM-driven structured synthesis, and writes a formatted Markdown digest
-directly into a local Obsidian vault.
+into a local folder (including an Obsidian vault). Obsidian is optional.
 
 See `literature_agent_architecture.md` for the full architecture specification.
 
@@ -20,12 +20,15 @@ Europe PMC      Title matching        Field pulse         Vault writer
 FreshLit's concept, architecture specification, and research profile are the
 author's own work. The implementation — code, debugging, and documentation — was
 developed with AI assistance (opencode, an AI coding agent) under human
-supervision. All AI-generated code was reviewed and tested by the author before
-being committed; no unreviewed AI output is included.
+supervision.
 
 ## Setup
 
-1. Create the environment and install the current checkout and its dependencies:
+Requires **Python 3.11+ and macOS or Linux/POSIX**. Native Windows is not currently
+supported by the hardened Codex launcher or secure digest writer. Installation
+currently uses a source checkout, not a standalone wheel/pipx deployment.
+
+1. From the repository root, create the environment and install FreshLit:
 
    ```bash
    python3 -m venv .venv
@@ -35,56 +38,84 @@ being committed; no unreviewed AI output is included.
    The editable install also creates `.venv/bin/freshlit` and keeps it pointed at
    this checkout. The official `openai-codex` SDK is pinned to `0.147.0`.
 
-2. Create a dedicated Codex profile directory owned by your user. It must already
-   exist, be outside this repository, and grant no group/other access. Do not use
-   `sudo`, run Codex as root, or share this directory with another Codex use:
+2. Initialize the missing user files:
 
    ```bash
-   mkdir -p "$HOME/.freshlit-codex"
-   chmod 700 "$HOME/.freshlit-codex"
+   .venv/bin/freshlit init
    ```
 
-3. Install the official Codex tooling and complete a one-time **ChatGPT OAuth**
-   login as described in the [official Codex authentication
-   documentation](https://developers.openai.com/codex/auth/), directing Codex to
-   that dedicated profile:
+   This copies the neutral profile template and `.env.example` only if your local
+   files do not exist. It never overwrites them. Edit `config/research_profile.md`
+   with **your chosen search keywords/topics** and a research description; see
+   [Research profile](#research-profile). An incomplete template cannot run.
+
+   In `.env`, optionally set `FRESHLIT_VAULT_PATH` to your output directory and
+   `OPENALEX_API_KEY` for a larger OpenAlex request budget. A normal Markdown
+   folder works; no Obsidian installation or plugin is required.
+
+3. Prepare the configured output directory and dedicated Codex home:
+
+   ```bash
+   .venv/bin/freshlit init --create-output-dir --prepare-codex-home
+   ```
+
+   These explicit flags create missing directories. The Codex home must be
+   outside this repository, owned by you, and mode `0700`; existing unsafe
+   permissions are rejected, not silently changed. Do not use `sudo` or share
+   this directory with another Codex use. New `.env` files select
+   `~/.freshlit-codex`; existing configured paths remain supported.
+
+4. Install the official Codex CLI and complete **ChatGPT OAuth** login as described
+   in the [official authentication documentation](https://developers.openai.com/codex/auth/).
+   Initialization prints a shell-quoted login command for your configured path.
+   With the default path:
 
    ```bash
    CODEX_HOME="$HOME/.freshlit-codex" codex login
    ```
 
-   Select ChatGPT login, not API-key authentication. FreshLit does not start the
-   login flow and does not open, parse, or inspect auth files; the official Codex
-   runtime uses the prepared profile. FreshLit verifies the effective safety
-   configuration, built-in OpenAI provider, ChatGPT account, and requested model.
+   Select ChatGPT login, not API-key authentication. FreshLit never initiates
+   login or reads authentication files. Full runs verify the effective safety
+   configuration, account, and availability of the configured model. The explicit
+   [gateway alternative](#gateway-rollback) does not require Codex setup.
 
-4. Copy `.env.example` to `.env` and configure the absolute profile path:
-
-   ```env
-   FRESHLIT_CODEX_HOME="/Users/you/.freshlit-codex"
-   ```
-
-   - `FRESHLIT_CODEX_HOME` — overrides `llm.codex_home`. Codex LLM runs require
-     a dedicated authenticated profile configured through either setting.
-   - `FRESHLIT_LLM_PROVIDER` — optional; defaults to `codex`.
-   - `OPENALEX_API_KEY` — optional but recommended; the free OpenAlex API key.
-     Anonymous requests have a small daily budget (resets midnight UTC).
-   - `OPENCODE_GO_API_KEY` — rollback-only and ignored unless `gateway` is
-     explicitly selected; see [Gateway rollback](#gateway-rollback).
-
-5. Review `config/settings.yaml` (vault path is pre-set) and
-   `config/research_profile.md` (keywords + research description, drafted from
-   your vault notes).
-
-6. Initialize the database and build the profile vector (downloads SPECTER2 on
-   first run):
+5. Check local setup, then run:
 
    ```bash
-   .venv/bin/python -m freshlit.main init-db
-   .venv/bin/python -m freshlit.main build-profile
+   .venv/bin/freshlit doctor
+   .venv/bin/freshlit run
    ```
 
+   `doctor` is local and read-only: no requests, downloads, model loading, login,
+   or auth-file inspection. It cannot verify account/model access. The first
+   `run` initializes the database and builds the profile vector automatically;
+   building may download the embedding model. Later profile/model changes trigger
+   a rebuild. Manual `init-db` and `build-profile` remain available and do not
+   require LLM credentials.
+
 ## Updating an existing installation
+
+Before replacing old configuration files, retain copies of your existing
+`config/settings.yaml`, `config/journal_tiers.json`, and private profile. The new
+public defaults no longer contain the original author's topics or venue weights.
+Migrate while your old local research settings are still present (restore them
+from your copies if needed):
+
+```bash
+.venv/bin/freshlit migrate-profile          # preview only, printed to stdout
+.venv/bin/freshlit migrate-profile --apply  # writes profile + exclusive .bak
+```
+
+Migration copies effective topics, Europe PMC choices, and venue weights into
+the profile front matter without altering the existing Markdown body. It makes
+`config/research_profile.md.bak` before the first write, refuses to overwrite an
+existing backup, and does not touch the database, credentials, or other settings.
+An already-modern profile is not rewritten. Conflicting settings keyword
+overrides require manual resolution; they are not silently merged.
+
+After migration, remove the matching research-only settings from the old YAML
+and venue JSON. Nonempty conflicting legacy values fail with guidance. Retain
+your output path, provider/model, thresholds, and other operational choices.
 
 Once the intended source changes are in this checkout, refresh the editable
 installation and verify it from the project root:
@@ -98,8 +129,9 @@ installation and verify it from the project root:
 This refreshes FreshLit's dependency metadata and console command without a
 blanket dependency upgrade. Preserve local source changes, the existing
 environment configuration, data, and authenticated Codex profile; there is no
-need to recreate them. Installing only `requirements.txt` does not refresh the
-installed FreshLit package metadata.
+need to recreate them. `pyproject.toml` is the dependency source of truth;
+`requirements.txt` is now a compatibility entry point for the same editable
+installation, not a second list to maintain. No dependency versions were changed.
 
 FreshLit launches the SDK's bundled, version-matched Codex runtime. Updating a
 separate global `codex` command does not update that runtime. Keep the SDK pin
@@ -125,13 +157,24 @@ requires an explicit subcommand; it does not start the pipeline automatically.
 .venv/bin/python -m freshlit.main run --max-candidates 20
 .venv/bin/python -m freshlit.main run --skip-llm
 .venv/bin/python -m freshlit.main run --from-cache
+.venv/bin/python -m freshlit.main run --reconsider-rejected
 .venv/bin/python -m freshlit.main run --dry-run
 .venv/bin/python -m freshlit.main run --force
 ```
 
 Other supported overrides include `--output-name`. `--from-cache` reuses
 `data/last_ingest.json`; `--skip-llm` stops after vector ranking. CLI provider and
-model options override their configured values for that run.
+model options override their configured values for that run. `--from-cache` fails
+if no cache exists rather than silently fetching. Legacy caches and caches from
+other queries/date windows can be replayed explicitly, with a warning.
+
+Changing the profile does not delete paper history. If FreshLit detects history
+from another or unknown profile/selection context, it warns. Use
+`--reconsider-rejected` to re-evaluate rejected papers **present in the current
+ingestion or replay cache**. It retains passed-paper history and within-batch
+deduplication; it does not fetch all previously rejected papers. Use a suitable
+lookback or an explicit cache replay to supply them. Mixed-history warnings remain
+conservative because older rejected rows are not erased.
 
 `--dry-run` skips paper-disposition updates and digest delivery, but it can still
 initialize the database, update ingestion/profile caches, download embeddings,
@@ -155,22 +198,97 @@ closed. Other editors must cooperate with the lock to avoid conflicting edits.
 
 | File | Purpose |
 |---|---|
-| `config/settings.yaml` | Vault paths, lookback window, topics, thresholds, LLM provider/model, timeout/retries, batching/concurrency |
-| `config/research_profile.md` | Editable keywords + research description driving queries and the vector/LLM profile |
-| `config/journal_tiers.json` | ISSN -> venue weight multiplier |
+| `config/settings.yaml` | Output paths, lookback, thresholds, LLM provider/model, timeout/retries, batching/concurrency |
+| `config/research_profile.md` | User-chosen search selectors, optional venue preferences, and research context; gitignored |
+| `config/journal_tiers.json` | Legacy compatibility only; new venue preferences live in the profile |
 | `data/cache.db` | SQLite dedup/disposition history (state) |
 | `data/profile_exemplars.json` | Generated profile vector (from `build-profile`) |
 
+## Research profile
+
+**Retrieval is not AI-generated.** You select the keywords and topic IDs. FreshLit
+constructs API queries deterministically: quoted keywords joined by OR, plus a
+separate OpenAlex topic query when topics are selected. These result streams are
+combined, not intersected. Europe PMC is an explicit opt-in for biomedical
+coverage; it uses the same keywords. Topic-only profiles work with OpenAlex, but
+Europe PMC needs keywords to search.
+
+The profile's YAML front matter contains structured choices; the Markdown body
+contains the keywords and research context. For example:
+
+```markdown
+---
+version: 1
+search:
+  openalex_topics: []
+  europe_pmc:
+    enabled: false
+    sources: [PPR]
+venue_weights: []
+---
+# Research Profile
+
+## Keywords
+- exoplanet atmospheres
+- transmission spectroscopy
+
+## Research Description
+I study exoplanet atmospheres using observational spectroscopy. Include new
+observational constraints and transferable retrieval methods. Exclude papers
+concerned only with Solar System missions.
+```
+
+Optional topic lookup uses OpenAlex directly, not an LLM, and never edits your
+profile automatically:
+
+```bash
+.venv/bin/freshlit topics "exoplanet atmospheres"
+```
+
+Copy selected `{id, label}` entries from its output into `search.openalex_topics`.
+IDs control retrieval; labels are for you. Canonical OpenAlex topic URLs are also
+accepted. Optional `venue_weights` entries have `issn`, `weight`, and an optional
+`name`; unlisted venues use `filtering.default_journal_weight` (normally `1.0`).
+
+The Markdown body drives the vector profile and both relevance/synthesis prompts.
+The AI evaluates retrieved papers against your stated interests and exclusions;
+it does not choose initial search terms. Front matter is excluded from embedding
+and LLM text so changing a display label cannot change ranking. For compatibility,
+embedding inputs retain the complete Markdown body and a separate keyword text;
+editing that body can therefore change ranking. Never put credentials in it.
+
+Both `## Keywords` and `## Research Description` are required for new profiles.
+Use `- ` keyword bullets; provide at least one keyword or topic and a nonblank
+research description. The unfinished example is never used as a fallback.
+
 ## Tuning
 
-- **Research focus** — edit `config/research_profile.md`, then
-  `build-profile`. Keywords are OR-combined into chunked OpenAlex searches.
+- **Research focus** — edit `config/research_profile.md`; the next run detects
+  stale vectors and rebuilds them. `build-profile` can refresh explicitly.
 - **Selectivity** — `filtering.vector_threshold` (floor), `score_cutoff`
   (qualify at >= 7.0), `max_llm_candidates` (LLM-scoring budget).
-- **Venue weighting** — add/remove ISSNs in `journal_tiers.json`.
+- **Venue weighting** — edit the optional named `venue_weights` in the profile.
 - **LLM latency** — `llm.model`, `filtering.llm_batch_size`, `llm.workers`,
   `llm.timeout_seconds`, and `llm.max_retries`. The CLI can override the model,
   provider, and candidate count without changing configuration.
+
+## Scheduling
+
+FreshLit does not install a background service. After a successful manual run,
+schedule the checkout's **absolute** `.venv/bin/freshlit run` path using cron on
+Linux/macOS or launchd on macOS. For example, a cron entry running Mondays at
+08:00 (scheduler-local time) is:
+
+```cron
+0 8 * * 1 /absolute/path/to/FreshLit/.venv/bin/freshlit run >> /absolute/path/to/freshlit.log 2>&1
+```
+
+Quote executable/log paths if they contain spaces. Configuration is located from
+the source checkout, not the scheduler's working directory. Run as the same user
+who owns the private Codex home; ensure no overlapping runs and arrange log
+rotation. Ingestion dates use `ingestion.timezone` (UTC by default), independently
+of the scheduler's timezone. Moving the checkout may require recreating its
+virtual environment and updating the scheduled executable path.
 
 ## Codex runtime and security model
 

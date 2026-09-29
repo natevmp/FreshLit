@@ -1,19 +1,12 @@
 obsidian:
-  vault_path: "~/Documents/FreshLit"  # overridden by FRESHLIT_VAULT_PATH in .env
+  vault_path: "~/Documents/FreshLit"  # any Markdown output folder; .env can override
   digest_folder: ""          # relative to vault_path ("" = root of that folder)
 
 ingestion:
   lookback_days: 7
   timezone: "UTC"
   max_results_per_query: 200  # per OpenAlex/EPMC query (search results are relevance-sorted)
-  openalex_topics:
-    - "T11764"   # Evolution and Genetic Dynamics
-    - "T11287"   # Cancer Genomics and Diagnostics
-    - "T10012"   # Genetic Diversity and Population Structure
-  keywords: []               # populated from config/research_profile.md at runtime
-  europe_pmc:
-    enabled: true
-    sources: ["PPR"]         # preprints (bioRxiv/medRxiv)
+  # User-chosen keywords, topics, and Europe PMC opt-in live in research_profile.md.
 
 api:
   request_timeout_seconds: 30
@@ -36,6 +29,7 @@ llm:
   timeout_seconds: 120
   workers: 3
   max_retries: 2
-  codex_home: "~/Library/Application Support/FreshLit/codex-home" # FRESHLIT_CODEX_HOME overrides this
+  # Legacy install fallback; `freshlit init` creates a portable .env override.
+  codex_home: "~/Library/Application Support/FreshLit/codex-home"
   # Rollback-only gateway setting; used only when provider is "gateway".
   base_url: "https://opencode.ai/zen/go/v1"

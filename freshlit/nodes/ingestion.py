@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -19,6 +20,8 @@ log = logging.getLogger(__name__)
 
 OPENALEX_WORKS = "https://api.openalex.org/works"
 EUROPE_PMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+INGEST_CACHE_SCHEMA_VERSION = 1
+QUERY_PROVENANCE_VERSION = 1
 
 
 class RawPaper(BaseModel):
@@ -186,9 +189,13 @@ def _chunk_keywords(keywords: list[str], budget: int = 3000) -> list[str]:
     return searches
 
 
-def fetch_openalex(settings: Settings) -> list[RawPaper]:
+def fetch_openalex(
+    settings: Settings,
+    *,
+    date_window: tuple[str, str] | None = None,
+) -> list[RawPaper]:
     session = requests.Session()
-    date_from, date_to = _date_window(settings)
+    date_from, date_to = date_window or _date_window(settings)
     papers: list[RawPaper] = []
 
     topics = settings.ingestion.openalex_topics
@@ -240,11 +247,15 @@ def _epmc_to_paper(item: dict) -> RawPaper | None:
         return None
 
 
-def fetch_europe_pmc(settings: Settings) -> list[RawPaper]:
+def fetch_europe_pmc(
+    settings: Settings,
+    *,
+    date_window: tuple[str, str] | None = None,
+) -> list[RawPaper]:
     if not settings.ingestion.europe_pmc.enabled:
         return []
     session = requests.Session()
-    date_from, date_to = _date_window(settings)
+    date_from, date_to = date_window or _date_window(settings)
     srcs = " OR ".join(
         f'SRC:"{s}"' for s in settings.ingestion.europe_pmc.sources
     )
@@ -288,9 +299,20 @@ def fetch_europe_pmc(settings: Settings) -> list[RawPaper]:
 # ------------------------------------------------------------------ driver
 
 
-def ingest(settings: Settings) -> list[RawPaper]:
-    """Fetch from all sources; dedup identical IDs within the batch."""
-    papers = fetch_openalex(settings) + fetch_europe_pmc(settings)
+def ingest(
+    settings: Settings,
+    *,
+    cache_path: Path | None = None,
+) -> list[RawPaper]:
+    """Fetch and deduplicate, optionally caching with the exact query window."""
+    provenance = _query_provenance(settings)
+    date_window = (
+        provenance["date_window"]["from"],
+        provenance["date_window"]["to"],
+    )
+    papers = fetch_openalex(settings, date_window=date_window) + fetch_europe_pmc(
+        settings, date_window=date_window
+    )
     seen: set[str] = set()
     unique: list[RawPaper] = []
     for p in papers:
@@ -299,14 +321,249 @@ def ingest(settings: Settings) -> list[RawPaper]:
         seen.add(p.id)
         unique.append(p)
     log.info("Ingestion complete: %d unique papers", len(unique))
+    if cache_path is not None:
+        save_ingest_cache(
+            cache_path,
+            unique,
+            settings,
+            query_provenance=provenance,
+        )
     return unique
 
 
-def save_ingest_cache(path: Path, papers: list[RawPaper]) -> None:
+def _query_provenance(
+    settings: Settings,
+    *,
+    date_window: tuple[str, str] | None = None,
+) -> dict:
+    """Describe only settings that determine the effective API result set."""
+    date_from, date_to = date_window or _date_window(settings)
+    return {
+        "version": QUERY_PROVENANCE_VERSION,
+        "selection": {
+            "openalex_topics": list(settings.ingestion.openalex_topics),
+            "keywords": list(settings.ingestion.keywords),
+        },
+        "date_window": {"from": date_from, "to": date_to},
+        "europe_pmc": {
+            "enabled": settings.ingestion.europe_pmc.enabled,
+            "sources": list(settings.ingestion.europe_pmc.sources),
+        },
+        "limits": {
+            "max_results_per_query": settings.ingestion.max_results_per_query,
+            "max_pages": settings.api.max_pages,
+            "openalex_page_size": 200,
+            "europe_pmc_page_size": 200,
+            "keyword_chunk_budget": 3000,
+        },
+    }
+
+
+def _provenance_fingerprint(provenance: dict) -> str:
+    encoded = json.dumps(
+        provenance,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_query_provenance(path: Path, provenance: dict) -> None:
+    def malformed(detail: str) -> None:
+        raise ValueError(
+            f"Malformed ingest cache {path}: query provenance {detail}; remove "
+            "it or rerun without --from-cache."
+        )
+
+    if set(provenance) != {
+        "version",
+        "selection",
+        "date_window",
+        "europe_pmc",
+        "limits",
+    }:
+        malformed("has missing or unknown fields")
+    if (
+        not isinstance(provenance["version"], int)
+        or isinstance(provenance["version"], bool)
+        or provenance["version"] != QUERY_PROVENANCE_VERSION
+    ):
+        malformed(f"has unsupported version {provenance['version']!r}")
+
+    selection = provenance["selection"]
+    if not isinstance(selection, dict) or set(selection) != {
+        "openalex_topics",
+        "keywords",
+    }:
+        malformed("has an invalid selection")
+    for field in ("openalex_topics", "keywords"):
+        if not isinstance(selection[field], list) or not all(
+            isinstance(value, str) for value in selection[field]
+        ):
+            malformed(f"selection.{field} must be a string array")
+
+    date_window = provenance["date_window"]
+    if (
+        not isinstance(date_window, dict)
+        or set(date_window) != {"from", "to"}
+        or not all(isinstance(date_window[field], str) for field in ("from", "to"))
+    ):
+        malformed("has an invalid date window")
+
+    europe_pmc = provenance["europe_pmc"]
+    if (
+        not isinstance(europe_pmc, dict)
+        or set(europe_pmc) != {"enabled", "sources"}
+        or not isinstance(europe_pmc["enabled"], bool)
+        or not isinstance(europe_pmc["sources"], list)
+        or not all(isinstance(value, str) for value in europe_pmc["sources"])
+    ):
+        malformed("has invalid Europe PMC settings")
+
+    limits = provenance["limits"]
+    expected_limit_fields = {
+        "max_results_per_query",
+        "max_pages",
+        "openalex_page_size",
+        "europe_pmc_page_size",
+        "keyword_chunk_budget",
+    }
+    if not isinstance(limits, dict) or set(limits) != expected_limit_fields:
+        malformed("has invalid query limits")
+    if not all(
+        isinstance(limits[field], int) and not isinstance(limits[field], bool)
+        for field in expected_limit_fields
+    ):
+        malformed("query limits must be integers")
+    if (
+        limits["openalex_page_size"] != 200
+        or limits["europe_pmc_page_size"] != 200
+        or limits["keyword_chunk_budget"] != 3000
+    ):
+        malformed("does not match this query implementation")
+
+
+def ingest_query_fingerprint(settings: Settings) -> str:
+    """Return a deterministic fingerprint of the effective ingestion queries."""
+    return _provenance_fingerprint(_query_provenance(settings))
+
+
+def save_ingest_cache(
+    path: Path,
+    papers: list[RawPaper],
+    settings: Settings | None = None,
+    *,
+    query_provenance: dict | None = None,
+) -> None:
+    """Save papers, including query provenance when settings are available."""
+    records = [paper.model_dump() for paper in papers]
+    if settings is None:
+        if query_provenance is not None:
+            raise ValueError("query_provenance requires settings")
+        payload: list[dict] | dict = records
+    else:
+        if query_provenance is None:
+            provenance = _query_provenance(settings)
+        else:
+            _validate_query_provenance(path, query_provenance)
+            captured_window = (
+                query_provenance["date_window"]["from"],
+                query_provenance["date_window"]["to"],
+            )
+            expected = _query_provenance(settings, date_window=captured_window)
+            if query_provenance != expected:
+                raise ValueError(
+                    "Query provenance does not match the settings used for "
+                    "ingestion; refusing to write an inconsistent cache envelope."
+                )
+            provenance = query_provenance
+        payload = {
+            "schema_version": INGEST_CACHE_SCHEMA_VERSION,
+            "query_provenance": provenance,
+            "query_fingerprint": _provenance_fingerprint(provenance),
+            "records": records,
+        }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps([p.model_dump() for p in papers]))
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def load_ingest_cache(path: Path) -> list[RawPaper]:
-    with path.open() as fh:
-        return [RawPaper.model_validate(d) for d in json.load(fh)]
+def _validate_cached_records(path: Path, records: object) -> list[RawPaper]:
+    if not isinstance(records, list):
+        raise ValueError(
+            f"Malformed ingest cache {path}: 'records' must be a JSON array"
+        )
+    papers: list[RawPaper] = []
+    for index, record in enumerate(records):
+        try:
+            papers.append(RawPaper.model_validate(record))
+        except Exception as exc:
+            raise ValueError(
+                f"Malformed ingest cache {path}: invalid record at index {index}: "
+                f"{exc}"
+            ) from exc
+    return papers
+
+
+def load_ingest_cache(
+    path: Path, settings: Settings | None = None
+) -> list[RawPaper]:
+    """Load a cache; explicit offline replay is allowed despite stale provenance."""
+    try:
+        with path.open(encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read ingest cache {path}: {exc}") from exc
+
+    if isinstance(payload, list):
+        log.warning(
+            "Legacy ingest cache %s has no query provenance; --from-cache will "
+            "replay its original, unknown selection and date window.",
+            path,
+        )
+        return _validate_cached_records(path, payload)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Malformed ingest cache {path}: expected a versioned object or "
+            "legacy record array"
+        )
+
+    schema_version = payload.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != INGEST_CACHE_SCHEMA_VERSION
+    ):
+        if schema_version is None:
+            detail = "missing 'schema_version'"
+        else:
+            detail = f"unsupported schema version {schema_version!r}"
+        raise ValueError(
+            f"Cannot load ingest cache {path}: {detail}; remove it or rerun "
+            "without --from-cache."
+        )
+    provenance = payload.get("query_provenance")
+    stored_fingerprint = payload.get("query_fingerprint")
+    if not isinstance(provenance, dict):
+        raise ValueError(
+            f"Malformed ingest cache {path}: missing query provenance"
+        )
+    _validate_query_provenance(path, provenance)
+    if not isinstance(stored_fingerprint, str) or not stored_fingerprint:
+        raise ValueError(
+            f"Malformed ingest cache {path}: missing query fingerprint"
+        )
+    if _provenance_fingerprint(provenance) != stored_fingerprint:
+        raise ValueError(
+            f"Malformed ingest cache {path}: query provenance fingerprint "
+            "does not match its metadata"
+        )
+
+    papers = _validate_cached_records(path, payload.get("records"))
+    if settings is not None and stored_fingerprint != ingest_query_fingerprint(settings):
+        log.warning(
+            "Ingest cache provenance differs from the current query selection, "
+            "date window, or query limits; --from-cache is explicitly replaying "
+            "the old result set and will not refresh it."
+        )
+    return papers

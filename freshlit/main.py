@@ -1,6 +1,10 @@
 """FreshLit pipeline orchestrator / CLI entrypoint.
 
 Usage:
+    freshlit init [--create-output-dir] [--prepare-codex-home]
+    freshlit doctor
+    freshlit topics "search phrase"
+    freshlit migrate-profile [--apply]
     freshlit init-db
     freshlit build-profile
     freshlit run [--lookback DAYS] [--limit N] [--dry-run] [--force]
@@ -13,7 +17,7 @@ import logging
 import sys
 
 from .utils import db, embeddings
-from .utils.config import load_settings
+from .utils.config import _project_root, load_settings
 
 log = logging.getLogger("freshlit")
 
@@ -40,7 +44,8 @@ def _cmd_init_db(settings) -> None:
 def _cmd_build_profile(settings) -> None:
     vector = embeddings.build_profile_vector(settings)
     embeddings.save_profile_vector(
-        settings.profile_vector_path, vector, settings.filtering.embedding_model
+        settings.profile_vector_path, vector, settings.filtering.embedding_model,
+        fingerprint=embeddings.profile_fingerprint(settings),
     )
     log.info(
         "Profile vector saved (%d dims) -> %s",
@@ -53,7 +58,10 @@ def _cmd_run(args) -> None:
     from .nodes import delivery, filtering, ingestion, synthesis
     from .utils.llm import build_client
 
-    settings = load_settings(provider_override=getattr(args, "provider", None))
+    settings = load_settings(
+        provider_override=getattr(args, "provider", None),
+        require_llm_credentials=not args.skip_llm,
+    )
     if args.lookback is not None:
         settings.ingestion.lookback_days = args.lookback
     if args.max_candidates is not None:
@@ -61,18 +69,25 @@ def _cmd_run(args) -> None:
     if args.model is not None:
         settings.llm.model = args.model
 
+    cache_path = settings.project_root / "data" / "last_ingest.json"
+    if args.from_cache and not cache_path.is_file():
+        raise FileNotFoundError(
+            "No ingestion cache is available. Run without --from-cache to fetch "
+            "papers; offline replay never silently starts a network fetch."
+        )
+    if not args.dry_run and not args.skip_llm:
+        delivery.validate_destination(settings, filename=args.output_name)
+
     _cmd_init_db(settings)
-    if not settings.profile_vector_path.exists():
-        log.info("No profile vector found; building it now...")
+    if not embeddings.profile_vector_is_current(settings):
+        log.info("Profile vector is missing or stale; rebuilding it now...")
         _cmd_build_profile(settings)
 
-    cache_path = settings.project_root / "data" / "last_ingest.json"
-    if args.from_cache and cache_path.exists():
-        papers = ingestion.load_ingest_cache(cache_path)
+    if args.from_cache:
+        papers = ingestion.load_ingest_cache(cache_path, settings=settings)
         log.info("[--from-cache] loaded %d papers", len(papers))
     else:
-        papers = ingestion.ingest(settings)
-        ingestion.save_ingest_cache(cache_path, papers)
+        papers = ingestion.ingest(settings, cache_path=cache_path)
 
     if args.limit:
         papers = papers[: args.limit]
@@ -84,7 +99,10 @@ def _cmd_run(args) -> None:
         return
 
     if args.skip_llm:
-        ranked = filtering.preprocess_and_rank(papers, settings, dry_run=True)
+        ranked = filtering.preprocess_and_rank(
+            papers, settings, dry_run=True,
+            reconsider_rejected=args.reconsider_rejected,
+        )
         log.info("[skip-llm] top %d candidates by vector similarity:", len(ranked))
         for i, (p, sim) in enumerate(ranked, 1):
             log.info("  %2d. %.3f  [%s] %s", i, sim, p.source_type, p.title[:90])
@@ -92,7 +110,8 @@ def _cmd_run(args) -> None:
 
     with build_client(settings) as client:
         qualified = filtering.filter_and_score(
-            papers, settings, client, dry_run=args.dry_run
+            papers, settings, client, dry_run=args.dry_run,
+            reconsider_rejected=args.reconsider_rejected,
         )
         if not qualified:
             log.info("No papers passed all filters; nothing to deliver.")
@@ -115,10 +134,28 @@ def _cmd_run(args) -> None:
     )
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="freshlit", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    init = sub.add_parser("init", help="Create missing user files, never overwrite them")
+    init.add_argument("--create-output-dir", action="store_true",
+                      help="Create the configured output root if missing")
+    init.add_argument("--prepare-codex-home", action="store_true",
+                      help="Prepare a private Codex directory; login stays manual")
+    sub.add_parser("doctor", help="Read-only local setup checks; no network or downloads")
+    topics = sub.add_parser("topics", help="Look up user-chosen OpenAlex topics (network)")
+    topics.add_argument("query", help="Topic name or phrase to look up; no AI is used")
+    migrate = sub.add_parser("migrate-profile", help="Preview legacy profile migration")
+    migrate.add_argument("--apply", action="store_true",
+                         help="Write the profile after making an exclusive .bak backup")
     sub.add_parser("init-db", help="Create data/cache.db schema")
     sub.add_parser(
         "build-profile",
@@ -126,11 +163,11 @@ def main() -> None:
     )
 
     run = sub.add_parser("run", help="Run the full pipeline")
-    run.add_argument("--lookback", type=int, default=None,
+    run.add_argument("--lookback", type=_positive_int, default=None,
                      help="Override ingestion.lookback_days")
-    run.add_argument("--limit", type=int, default=None,
+    run.add_argument("--limit", type=_positive_int, default=None,
                      help="Cap number of ingested papers (testing)")
-    run.add_argument("--max-candidates", type=int, default=None,
+    run.add_argument("--max-candidates", type=_positive_int, default=None,
                      help="Override filtering.max_llm_candidates")
     run.add_argument("--model", default=None,
                       help="Override llm.model (e.g. gpt-5.6-luna)")
@@ -142,6 +179,8 @@ def main() -> None:
                      help="Stop after vector ranking; print top candidates")
     run.add_argument("--from-cache", action="store_true",
                      help="Reuse data/last_ingest.json instead of refetching")
+    run.add_argument("--reconsider-rejected", action="store_true",
+                     help="Re-evaluate rejected papers in this input; keep passed history")
     run.add_argument("--dry-run", action="store_true",
                      help="Skip paper-disposition updates and digest delivery; "
                           "setup/cache writes and LLM requests still occur")
@@ -155,8 +194,39 @@ def main() -> None:
     try:
         if args.command == "run":
             _cmd_run(args)
+        elif args.command in {"init", "doctor", "topics"}:
+            from .utils import onboarding
+
+            root = _project_root()
+            if args.command == "init":
+                messages = onboarding.initialize(
+                    root, create_output_dir=args.create_output_dir,
+                    prepare_codex_home=args.prepare_codex_home,
+                )
+            elif args.command == "doctor":
+                messages = onboarding.doctor(root)
+            else:
+                import yaml
+
+                results = onboarding.search_topics(args.query, root)
+                print(yaml.safe_dump({"openalex_topics": results}, sort_keys=False), end="")
+                return
+            for message in messages:
+                print(message)
+            if any(message.startswith("ERROR:") for message in messages):
+                sys.exit(1)
+        elif args.command == "migrate-profile":
+            from .utils.profile import migrate_profile
+
+            preview = migrate_profile(_project_root(), apply=args.apply)
+            if args.apply:
+                log.info("Profile ready; first migration preserves the original in "
+                         "config/research_profile.md.bak. Existing modern profiles are unchanged.")
+            else:
+                log.info("Migration preview only; use --apply to write with a backup.")
+                print(preview, end="")
         else:
-            settings = load_settings()
+            settings = load_settings(require_llm_credentials=False)
             if args.command == "init-db":
                 _cmd_init_db(settings)
             elif args.command == "build-profile":

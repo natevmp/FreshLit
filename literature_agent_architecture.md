@@ -2,13 +2,13 @@
 
 > **Revision note.** This is an adapted version of the original spec, incorporating: (1) project rename to **FreshLit** (package `freshlit`), (2) migration of the primary LLM provider to the official **openai-codex SDK** with ChatGPT OAuth (the former opencode-go integration is retained only for explicit rollback), (3) local **SPECTER2** embeddings, (4) an editable **research profile** Markdown file driving topics/keywords/vector filtering, (5) a central **configuration loader** (the original spec defined config file contents but no loading mechanism), and (6) robustness/security hardening surfaced by design review (request timeouts + pagination + retries, strict structured-output validation, isolated/disabled Codex capabilities, NULL-safe/DOI-normalized dedup, path-containment + atomic vault writes, secret hygiene).
 
-This document defines the system architecture, node interfaces, schemas, database tables, and execution flow for an automated literature monitoring agent named **FreshLit**. An executing code agent can read this specification directly to construct and run the system on the local filesystem.
+This document describes the system architecture. The executable implementation and README setup instructions are authoritative. Search selectors are explicitly user-authored; there is no AI query-generation stage. Profile front matter supplies topics/source/venue choices, and the Markdown body supplies keywords and research context to generic scoring and synthesis prompts.
 
 ---
 
 ## 1. System Overview
 
-FreshLit is a modular, four-stage ETL pipeline executed on a scheduled basis (weekly or bi-weekly). It ingests newly published papers and preprints, filters out duplicates and off-topic items, performs LLM-driven structured synthesis, and outputs a formatted Markdown file directly into a local Obsidian vault.
+FreshLit is a modular, four-stage ETL pipeline that can be scheduled externally (weekly or bi-weekly). It ingests newly published papers and preprints, filters out duplicates and off-topic items, performs LLM-driven structured synthesis, and outputs Markdown to a local directory, optionally an Obsidian vault. Current secure runtime/delivery support requires macOS or Linux/POSIX.
 
 ```text
 1. INGESTION ──► 2. DEDUP & FILTERING ──► 3. LLM SYNTHESIS ──► 4. OBSIDIAN DELIVERY
@@ -47,8 +47,8 @@ The codebase is organized as follows on the local filesystem:
 freshlit/                        # project root
 ├── config/
 │   ├── settings.yaml            # Query parameters, thresholds, vault paths, model selection
-│   ├── journal_tiers.json       # ISSN to multiplier weight mapping
-│   └── research_profile.md      # Editable keywords + research description (drives topics/keywords/vector profile)
+│   ├── journal_tiers.json       # Legacy ISSN weights, empty in new installs
+│   └── research_profile.md      # Private front matter + Markdown profile
 ├── data/
 │   ├── cache.db                 # SQLite database for state persistence
 │   ├── profile_exemplars.json   # Generated target research profile vector (built from research_profile.md)
@@ -64,6 +64,8 @@ freshlit/                        # project root
 │   │   └── delivery.py          # Node 4: Obsidian Markdown rendering & I/O
 │   └── utils/
 │       ├── config.py            # Central configuration loader (Pydantic-validated)
+│       ├── profile.py           # Typed user profile parsing and legacy migration
+│       ├── onboarding.py        # Local initialization, diagnostics, explicit topic lookup
 │       ├── db.py                # SQLite wrapper functions
 │       ├── llm.py               # Codex structured client + explicit gateway rollback client
 │       └── embeddings.py        # SPECTER2 embedding model loader (lazy singleton)
@@ -82,11 +84,11 @@ freshlit/                        # project root
 ### Node 1: Ingestion Engine (`freshlit/nodes/ingestion.py`)
 
 * **Primary Source:** OpenAlex REST API (`https://api.openalex.org/works`).
-* **Fallback/Direct Source:** Europe PMC REST API (for zero-lag bioRxiv/medRxiv preprints).
+* **Optional Biomedical Source:** Europe PMC REST API; opt-in in modern profiles, not an automatic fallback.
 * **Ingestion Logic:**
   1. Calculate date window: `[current_date - lookback_days]` to `[current_date]` (closed-open, timezone defined in `settings.yaml`).
-  2. Issue GET requests filtering by OpenAlex Topic IDs (from `ingestion.openalex_topics`) AND the publication-date window.
-  3. Combine with keyword queries derived from `config/research_profile.md` — keywords are OR-combined into chunked OpenAlex `search=` queries (under the ~4 KB URL limit).
+  2. Issue topic requests for user-selected IDs in profile `search.openalex_topics`, resolved to runtime `ingestion.openalex_topics`, AND the publication-date window.
+  3. Combine with independent keyword queries using the user's explicit `## Keywords` bullets — quoted keywords are OR-combined into chunked OpenAlex `search=` queries. Topic and keyword result streams form a union, not an intersection. An empty topic list disables that stream.
   4. Authenticate with the **OpenAlex API key** (`api_key=` query param, or `Authorization: Bearer`). *(The legacy `mailto=` polite-pool parameter was deprecated Feb 2026 and is no longer used.)*
 * **Resilience (hardening):**
   * Set explicit connect/read timeouts on every request (`api.request_timeout_seconds`).
@@ -125,7 +127,7 @@ This node operates as a 4-step reduction funnel:
    Normalize titles (strip punctuation, lowercase, stop-word removal). If title Jaro-Winkler similarity exceeds the configurable threshold (`filtering.dedup_title_similarity`, default `0.92`) AND first-author surnames match a historical record, treat as duplicate. Apply a **minimum-title-length guard** and robust surname parsing: the first-author surname extractor handles `Last, First`, `First Last`, and `Last Initial(s)` (e.g. Europe PMC's `"Parks M"`), plus organizational authors / "et al.". Precedence rule: peer-reviewed version wins over preprint; otherwise keep the newer `publication_date`.
 3. **Vector Similarity Filter:**
    * Model: local `allenai/specter2_base`.
-   * Embed `title + abstract`. Compute cosine similarity against the target profile vector (built from `config/research_profile.md`, cached in `data/profile_exemplars.json`).
+   * Embed `title + abstract`. Compute cosine similarity against the target profile vector (cached in `data/profile_exemplars.json`). Exact Markdown body and separate keyword text are the embedding inputs; front matter is excluded. Model/input fingerprints invalidate stale vectors automatically before a CLI run.
    * Drop records with missing/short abstracts (< 50 chars) and those below `filtering.vector_threshold` (default `0.65`).
    * Rank survivors by similarity and keep only the top `filtering.max_llm_candidates` (default `40`) — SPECTER2 similarities cluster in a narrow band, so ranking + a candidate budget is the effective filter; the threshold is only a floor.
 4. **LLM Reasoning & Weighted Scoring:**
@@ -153,15 +155,15 @@ class ScoredPaper(BaseModel):
 Final Score = LLM Score * W_venue
 ```
 
-Where `W_venue` is pulled from `config/journal_tiers.json` based on ISSN. Default for unlisted preprints is `filtering.default_journal_weight` (default `1.0`).
-* **Qualification Threshold:** Final Score >= `filtering.score_cutoff` (default `7.0`).
-* **Persistence:** all dispositions are written to `cache.db` inside a single transaction per run (atomic, no partial rows).
+Where `W_venue` is pulled from optional named profile `venue_weights` based on ISSN. Legacy `config/journal_tiers.json` is still supported for migration. All unlisted venues use `filtering.default_journal_weight` (default `1.0`).
+* **Qualification Threshold:** raw LLM score >= 7 AND Final Score >= `filtering.score_cutoff` (default `7.0`).
+* **Persistence:** dispositions are committed in stage-local transactions, not one transaction spanning delivery. Passed rows cannot be downgraded by later dedup rejection. An additive `history_contexts` table tracks observed selection fingerprints and warns on mixed/unknown history. `--reconsider-rejected` ignores rejected database entries for exact/fuzzy lookup but retains passed history and within-batch dedup; it only processes papers in the current input.
 
 ---
 
 ### Node 3: LLM Synthesis (`freshlit/nodes/synthesis.py`)
 
-Processes qualified candidates (Final Score >= `score_cutoff`) into structured summary units and generates an executive overview.
+Processes qualified candidates into structured summary units and generates an executive overview. Both single and batch prompts include profile context, with no fixed discipline or modeling requirement. The actual method and findings must come from the abstract; quantitative metrics are included only if reported. The generic field-pulse prompt remains unchanged.
 
 1. **Single-Paper Extraction:**
 
@@ -176,9 +178,9 @@ class ProcessedPaperSummary(BaseModel):
     doi_url: str
     final_score: float
     core_question: str = Field(..., description="1 sentence on central question")
-    framework_and_method: str = Field(..., description="Specific mathematical/computational/empirical method")
-    key_finding: str = Field(..., description="Main result including quantitative metrics")
-    code_data_link: str = Field(default="None stated", description="GitHub or dataset URL if present")
+    framework_and_method: str = Field(..., description="Specific method actually used in the paper")
+    key_finding: str = Field(..., description="Main result, quantitative metrics only when stated")
+    code_data_link: str = Field(default="None stated", description="Code or data repository URL if present")
     relevance_rationale: str
 ```
 
@@ -262,11 +264,15 @@ CREATE TABLE IF NOT EXISTS processed_papers (
 
 CREATE INDEX IF NOT EXISTS idx_doi ON processed_papers(doi);
 CREATE INDEX IF NOT EXISTS idx_norm_title ON processed_papers(normalized_title);
+
+CREATE TABLE IF NOT EXISTS history_contexts (
+    fingerprint TEXT PRIMARY KEY
+);
 ```
 
 * **DOI normalization:** store DOIs lowercase with the `https://doi.org/` prefix stripped.
 * **NULL-safe dedup:** the DOI check uses `IS NOT DISTINCT FROM` semantics and falls back to `paper_id` matching when `doi` is NULL.
-* **Atomicity:** batch inserts/dispositions are wrapped in a transaction per run.
+* **Atomicity:** inserts/dispositions are wrapped in stage-local transactions. Context tracking is additive and never deletes existing paper history.
 
 ---
 
@@ -285,22 +291,14 @@ All configuration is loaded once at startup by `freshlit/utils/config.py`, which
 
 ```yaml
 obsidian:
-  vault_path: "/Users/me/WorkVault/Work Vault/FreshLit"   # absolute path; digest written here
+  vault_path: "~/Documents/FreshLit"                       # ordinary Markdown folder is sufficient
   digest_folder: ""                                        # relative to vault_path ("" = root)
 
 ingestion:
   lookback_days: 7
   timezone: "UTC"                                          # defines the date-window boundary
   max_results_per_query: 200                               # per-query cap (search is relevance-sorted)
-  openalex_topics:                                         # OpenAlex topic IDs
-    - "T11764"                                             # Evolution and Genetic Dynamics
-    - "T11287"                                             # Cancer Genomics and Diagnostics
-    - "T10012"                                             # Genetic Diversity and Population Structure
-  keywords: []                                             # populated from config/research_profile.md;
-                                                           #   OR-combined into chunked `search=` queries
-  europe_pmc:
-    enabled: true
-    sources: ["PPR"]                                       # preprints (bioRxiv/medRxiv)
+  # User-chosen keywords, topics, and Europe PMC opt-in live in the profile.
 
 api:
   request_timeout_seconds: 30
@@ -335,11 +333,27 @@ llm:
 }
 ```
 
-ISSN (with dashes removed, as returned by OpenAlex) mapped to venue weight `W_venue`. Higher weight boosts high-impact venues; unlisted preprints default to `filtering.default_journal_weight`.
+Legacy ISSN-to-weight mapping only. New installations have no overrides. Modern profiles store optional `{issn, name, weight}` records in `venue_weights`; weights must be positive and finite. Labels are never used for retrieval or embeddings.
 
 ### `config/research_profile.md`
 
-An editable Markdown file with two sections that drive the whole pipeline: a `## Keywords` list (used for OpenAlex/Europe PMC queries) and a `## Research Description` prose block (used to build the vector profile and the LLM relevance rubric). The pipeline reads this file at runtime and regenerates `data/profile_exemplars.json` via `freshlit build-profile`.
+An editable Markdown file with validated version-1 YAML front matter:
+
+```yaml
+version: 1
+search:
+  openalex_topics: []     # explicit {id, label} selections; no automatic inference
+  europe_pmc:
+    enabled: false
+    sources: [PPR]
+venue_weights: []
+```
+
+The body contains `## Keywords` bullets and a nonblank `## Research Description`. Keywords may be empty when topic IDs are selected. Both sections are required; unfinished templates are rejected. The whole body and a separate keyword text feed the vector profile, while only the body feeds the relevance/extraction prompts. Front matter never enters these inputs.
+
+`freshlit init` creates missing private files without replacing them. `freshlit doctor` performs local read-only checks without downloading models, inspecting auth files, or making requests. `freshlit topics "phrase"` explicitly queries OpenAlex autocomplete and prints choices without modifying the profile or using an LLM. `freshlit migrate-profile` previews conversion from legacy settings, and `--apply` backs up the original before writing the profile; matching legacy settings can then be removed manually. Missing profiles never silently fall back to the example.
+
+Profile vectors record model, dimensions, input fingerprint, and schema version. CLI runs rebuild stale/legacy vectors. Ingestion caches record effective query selections/date windows/limits; `--from-cache` warns when provenance differs and never fetches automatically when its cache is missing. Query cache metadata contains no credentials. Local files remain tied to the editable source checkout; standalone installation and new providers/sources are separate future work.
 
 ### `.env` File
 
